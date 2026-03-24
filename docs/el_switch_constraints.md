@@ -18,6 +18,11 @@ instructions, and **downward** (to a lower EL) via the `ERET` instruction.
 Interrupts and other synchronous exceptions are **excluded** from this
 document; only manual invocations are covered.
 
+> **Note on SPSR_ELn** — SPSR is *software-controlled*, not an architectural
+> constraint.  The solver enumerates all hardware-reachable target ELs; the
+> caller must configure `SPSR_ELn.M[3:0]` to match the desired target before
+> executing the instruction.
+
 ---
 
 ## Key Control Registers
@@ -28,11 +33,11 @@ Only present when EL3 is implemented.
 
 | Bit | Name | Meaning |
 |-----|------|---------|
-| 0 | NS | **Non-Secure state**. When 0, EL0/EL1 (and optionally EL2) operate in Secure state. When 1, they operate in Non-Secure state. |
-| 7 | SMD | **Secure Monitor Call Disable**. When 1, `SMC` is disabled (UNDEF or trap). When 0, `SMC` causes an exception to EL3. |
-| 8 | HCE | **HVC instruction Enable**. When 1, `HVC` is permitted from EL1/EL2. When 0, `HVC` is UNDEF from EL1. |
-| 10 | RW | **Register Width**. When 1, EL2 and below run in AArch64. When 0, they run in AArch32. |
-| 18 | EEL2 | **Secure EL2 Enable**. When 1, EL2 is available in Secure state. Required for an ERET from EL3 to EL2 when `NS=0`. |
+| 0 | **NS** | **Non-Secure state**. When 0, EL0/EL1 (and optionally EL2) operate in Secure state. When 1, they operate in Non-Secure state. |
+| 7 | **SMD** | **Secure Monitor Call Disable**. When 1, `SMC` is UNDEF. When 0, `SMC` causes an exception to EL3. |
+| 8 | **HCE** | **HVC instruction Enable**. When 1, `HVC` is permitted from EL1/EL2. When 0, `HVC` is UNDEF from EL1. **There is no "HCR" field in SCR_EL3; the correct field name is HCE.** |
+| 10 | **RW** | **Register Width**. When 1, EL2 and below run in AArch64. When 0, they run in AArch32. |
+| 18 | **EEL2** | **Secure EL2 Enable** (ARMv8.4). When 1, EL2 is available in Secure state. Required for an `ERET` from EL3 to EL2 when `NS=0`. |
 
 ### HCR_EL2 — Hypervisor Configuration Register (EL2)
 
@@ -40,30 +45,32 @@ Only meaningful when EL2 is implemented.
 
 | Bit | Name | Meaning |
 |-----|------|---------|
-| 27 | TGE | **Trap General Exceptions**. When 1, all exceptions from EL0 are routed to EL2 instead of EL1. This includes `SVC`. |
-| 29 | HCD | **HVC Call Disable**. When 1, `HVC` from EL1 is trapped to EL3 (if present) or is UNDEF, rather than reaching EL2. |
-| 34 | E2H | **EL2 Host** mode. When 1, the processor is running in VHE (Virtualization Host Extension) mode. |
+| 12 | **DC** | **Default Cacheability**. When 1, enables stage-2 translation with default cacheability (implies `VM=1` semantics for data accesses). **DC does not affect exception routing** — it has no influence on whether SVC/HVC/SMC/ERET switches are legal. |
+| 19 | **TSC** | **Trap SMC**. When 1, Non-secure EL1 execution of `SMC` is trapped to EL2. This takes priority over routing to EL3. **Inactive** when in VHE host mode (`E2H=1 ∧ TGE=1`). |
+| 27 | **TGE** | **Trap General Exceptions**. When 1, all exceptions from EL0 are routed to EL2 (including `SVC`). Also participates in VHE host mode definition together with E2H. |
+| 29 | **HCD** | **HVC Call Disable**. When 1, `HVC` from EL1 is trapped to EL3 (if present) or UNDEF; EL2 is not reached. |
+| 34 | **E2H** | **EL2 Host** (VHE — Virtualization Host Extension). When E2H=1 **together with TGE=1**, the processor is in **VHE host mode**: the host OS runs directly at EL2, applications run at EL0/EL1; `HVC` from EL1 is UNDEF; `TSC` is inactive. When E2H=1 but TGE=0, the system is in *guest mode*; HVC from EL1 still works normally. |
 
-### SPSR_ELn — Saved Program Status Register
+### VHE Host Mode
 
-Used by `ERET` to determine the target state. The key field is:
+VHE host mode is active when **both** `HCR_EL2.E2H = 1` and `HCR_EL2.TGE = 1`.
+Its effects on manual EL switching:
 
-| Bits | Name | Meaning |
-|------|------|---------|
-| [3:2] | M\[3:2\] | Target exception level (00=EL0, 01=EL1, 10=EL2, 11=EL3) |
-| [0] | M\[0\] | Stack pointer select (0=SP\_EL0, 1=SP\_ELn) |
+| Effect | Details |
+|--------|---------|
+| `HVC` from EL1 → **UNDEFINED** | In VHE host mode the hypervisor host runs at EL2, so HVC from EL1 is architecturally UNDEFINED. |
+| `TSC` becomes **inactive** | `HCR_EL2.TSC` only traps Non-secure EL1 SMC when `E2H=0 ∨ TGE=0`; in VHE host mode the SMC goes normally to EL3 (subject to `SCR_EL3.SMD`). |
 
-Valid `M[3:0]` encodings in AArch64:
+### Security State
 
-| M[3:0] | Value | Meaning |
-|--------|-------|---------|
-| `0b0000` | 0 | EL0t — EL0, SP\_EL0 |
-| `0b0100` | 4 | EL1t — EL1, SP\_EL0 |
-| `0b0101` | 5 | EL1h — EL1, SP\_EL1 |
-| `0b1000` | 8 | EL2t — EL2, SP\_EL0 |
-| `0b1001` | 9 | EL2h — EL2, SP\_EL1 |
-| `0b1100` | 12 | EL3t — EL3, SP\_EL0 |
-| `0b1101` | 13 | EL3h — EL3, SP\_EL1 |
+When EL3 is implemented, `SCR_EL3.NS` controls the security state of lower ELs:
+
+- **Secure state** (`SCR_EL3.NS = 0`): lower ELs run in Secure World.
+  `HCR_EL2.TSC` does **not** trap SMC in this state.
+- **Non-Secure state** (`SCR_EL3.NS = 1`): lower ELs run in Normal World.
+  `HCR_EL2.TSC` is active (subject to VHE host mode).
+
+When EL3 is **not implemented**, the processor is always in Non-Secure state.
 
 ---
 
@@ -71,104 +78,129 @@ Valid `M[3:0]` encodings in AArch64:
 
 ### SVC (Supervisor Call)
 
-`SVC` causes a synchronous exception that is taken to **EL1 or EL2**.
+`SVC` causes a synchronous exception routed to **EL1 or EL2**.
+Reference: DDI 0487 D1.10.1
 
 #### SVC executed at EL0
 
 | Condition | Target EL | Valid? |
 |-----------|-----------|--------|
-| EL2 not implemented OR `HCR_EL2.TGE = 0` | EL1 | ✅ Valid |
-| EL2 implemented AND `HCR_EL2.TGE = 1` | EL2 | ✅ Valid |
+| EL2 not implemented **OR** `HCR_EL2.TGE = 0` | EL1 | ✅ |
+| EL2 implemented **AND** `HCR_EL2.TGE = 1` | EL2 | ✅ |
+
+`HCR_EL2.TGE` routes **all** EL0 exceptions (including SVC) to EL2 regardless of
+security state.
 
 **Formal constraint:**
 ```
-(EL2_implemented ∧ HCR_EL2.TGE = 1) → target = EL2
-¬(EL2_implemented ∧ HCR_EL2.TGE = 1) → target = EL1
+if EL2_implemented ∧ HCR_EL2.TGE = 1:
+    target = EL2
+else:
+    target = EL1
 ```
 
 #### SVC executed at EL1 or higher
 
-`SVC` at EL1 causes a synchronous exception that stays at EL1 (not an EL
-switch). `SVC` at EL2/EL3 is architecturally valid but is treated as an
-exception taken to the current EL (same-level switch, not covered here).
+`SVC` causes a same-level exception (stays at EL1). **Not an inter-level switch.**
 
 ---
 
 ### HVC (Hypervisor Call)
 
 `HVC` causes a synchronous exception taken to **EL2**.
+Reference: DDI 0487 D1.14.9
 
 #### HVC executed at EL0
 
-Always **UNDEFINED** (illegal instruction). No EL switch occurs.
+Always **UNDEFINED** (illegal instruction). No EL switch.
 
 #### HVC executed at EL1 → EL2
 
-All three conditions below must hold:
+All **four** conditions below must hold:
 
 | # | Constraint | Consequence if violated |
 |---|------------|------------------------|
 | 1 | EL2 is implemented | `HVC` is UNDEF |
-| 2 | EL3 not implemented, **OR** `SCR_EL3.HCE = 1` | `HVC` is UNDEF at EL1 |
-| 3 | `HCR_EL2.HCD = 0` | `HVC` is trapped to EL3 (if present) or UNDEF |
+| 2 | `HCR_EL2.E2H = 0` **OR** `HCR_EL2.TGE = 0` (NOT in VHE host mode) | `HVC` is UNDEFINED in VHE host mode |
+| 3 | EL3 not implemented, **OR** `SCR_EL3.HCE = 1` | `HVC` is UNDEF when EL3 present and HCE=0 |
+| 4 | `HCR_EL2.HCD = 0` | `HVC` is trapped to EL3 or UNDEF when HCD=1 |
 
 **Formal constraint:**
 ```
 EL2_implemented
+∧ ¬(HCR_EL2.E2H = 1 ∧ HCR_EL2.TGE = 1)   # not VHE host mode
 ∧ (¬EL3_implemented ∨ SCR_EL3.HCE = 1)
 ∧ HCR_EL2.HCD = 0
-→ target = EL2
+→ target = EL2   ✅
 ```
 
-#### HVC executed at EL2
+#### HVC executed at EL2 or EL3
 
-In standard (non-VHE) mode `HVC` from EL2 is effectively a self-exception to
-EL2 (no EL change). In VHE mode (`HCR_EL2.E2H = 1`) it is a host call. No
-EL switch occurs; excluded from this document.
-
-#### HVC executed at EL3
-
-`HVC` is treated as a NOP or UNDEF. No EL switch.
+Same-level exception or NOP; no inter-level switch.
 
 ---
 
 ### SMC (Secure Monitor Call)
 
-`SMC` causes a synchronous exception taken to **EL3**.
+`SMC` can route to **EL2 (trap)** or **EL3** depending on the register state.
+Reference: DDI 0487 D1.14.10
 
 #### SMC executed at EL0
 
-Always **UNDEFINED**. No EL switch occurs.
+Always **UNDEFINED**. No EL switch.
 
-#### SMC executed at EL1 → EL3
+#### SMC executed at EL1 → EL2 (TSC trap path)
 
-Both conditions below must hold:
+This path has **priority** over the EL3 path below.
+
+All conditions must hold:
+
+| # | Constraint | Detail |
+|---|------------|--------|
+| 1 | EL2 is implemented | TSC can only redirect to EL2 |
+| 2 | `HCR_EL2.TSC = 1` | TSC enabled |
+| 3 | Non-Secure state | `SCR_EL3.NS = 1` **or** EL3 not implemented |
+| 4 | NOT VHE host mode | `HCR_EL2.E2H = 0` **or** `HCR_EL2.TGE = 0` |
+
+**Formal constraint (EL1 → EL2 via TSC):**
+```
+EL2_implemented
+∧ HCR_EL2.TSC = 1
+∧ (¬EL3_implemented ∨ SCR_EL3.NS = 1)     # Non-Secure state
+∧ ¬(HCR_EL2.E2H = 1 ∧ HCR_EL2.TGE = 1)   # not VHE host mode
+→ target = EL2   ✅
+```
+
+#### SMC executed at EL1 → EL3 (normal path)
+
+Applies when the TSC trap path above does **not** fire.
 
 | # | Constraint | Consequence if violated |
 |---|------------|------------------------|
 | 1 | EL3 is implemented | `SMC` is UNDEF |
-| 2 | `SCR_EL3.SMD = 0` | `SMC` is UNDEF (or trapped to EL2 in some implementations) |
+| 2 | `SCR_EL3.SMD = 0` | `SMC` is UNDEF |
 
-**Formal constraint:**
+**Formal constraint (EL1 → EL3):**
 ```
-EL3_implemented
+¬TSC_trap_active                            # TSC path did not fire
+∧ EL3_implemented
 ∧ SCR_EL3.SMD = 0
-→ target = EL3
+→ target = EL3   ✅
 ```
 
 #### SMC executed at EL2 → EL3
 
-Same constraints as from EL1:
+TSC does **not** apply to EL2 execution. The same two conditions as above:
 
 ```
 EL3_implemented
 ∧ SCR_EL3.SMD = 0
-→ target = EL3
+→ target = EL3   ✅
 ```
 
 #### SMC executed at EL3
 
-Treated as a NOP by the architecture. No EL switch.
+NOP by the architecture. No EL switch.
 
 ---
 
@@ -176,93 +208,76 @@ Treated as a NOP by the architecture. No EL switch.
 
 ### ERET (Exception Return)
 
-`ERET` reads `SPSR_ELn` and `ELR_ELn` from the **current** exception level,
-then returns to the state described in `SPSR_ELn`.
-
-The target EL is `SPSR_ELn.M[3:2]`. The target EL **must** be strictly lower
-than (or equal to, but same-level ERET is architecturally reserved/UNDEF) the
-current EL.
+`ERET` restores execution to the EL encoded in `SPSR_ELn.M[3:2]` and sets PC
+from `ELR_ELn`.  Because SPSR is software-controlled, the solver reports **all**
+architecturally valid target ELs; the caller selects the actual target by
+configuring `SPSR_ELn` before the instruction.
+Reference: DDI 0487 D1.11.1
 
 #### ERET executed at EL0
 
 Always **UNDEFINED**.
 
-#### ERET executed at EL1 → EL0
+#### ERET executed at EL1
 
-| Constraint | Detail |
-|------------|--------|
-| `SPSR_EL1.M[3:2] = 0b00` | Target must be EL0 |
+| Reachable target | Constraints |
+|-----------------|-------------|
+| EL0 | Always reachable |
 
-Any other value of `SPSR_EL1.M[3:2]` is an illegal exception return.
-
-**Formal constraint:**
-```
-SPSR_EL1.M[3:2] = 0b00
-→ target = EL0   ✅
-```
+Set `SPSR_EL1.M[3:0] = 0b0000` (EL0t) or choose appropriately.
 
 #### ERET executed at EL2
 
-| `SPSR_EL2.M[3:2]` | Target | Valid? | Additional constraints |
-|--------------------|--------|--------|------------------------|
-| `0b00` | EL0 | ✅ | None |
-| `0b01` | EL1 | ✅ | None |
-| `0b10` | EL2 | ❌ | Illegal exception return (same level) |
-| `0b11` | EL3 | ❌ | Cannot ERET to higher EL |
+| Reachable target | Constraints |
+|-----------------|-------------|
+| EL0 | Always reachable |
+| EL1 | Always reachable |
 
-**Formal constraint:**
-```
-SPSR_EL2.M[3:2] ∈ {0b00, 0b01}
-→ target = EL(SPSR_EL2.M[3:2])   ✅
-```
+Set `SPSR_EL2.M[3:2] = 0b00` (EL0) or `0b01` (EL1).
 
 #### ERET executed at EL3
 
-| `SPSR_EL3.M[3:2]` | Target | Valid? | Additional constraints |
-|--------------------|--------|--------|------------------------|
-| `0b00` | EL0 | ✅ | None |
-| `0b01` | EL1 | ✅ | None |
-| `0b10` | EL2 | ✅ (conditional) | EL2 must be implemented **AND** (`SCR_EL3.NS = 1` OR `SCR_EL3.EEL2 = 1`) |
-| `0b11` | EL3 | ❌ | Illegal exception return (same level) |
+| Reachable target | Constraints |
+|-----------------|-------------|
+| EL0 | Always reachable |
+| EL1 | Always reachable |
+| EL2 | EL2 implemented **AND** (`SCR_EL3.NS = 1` **or** `SCR_EL3.EEL2 = 1`) |
 
-**Formal constraint for target EL2:**
+**Formal constraint for EL2 reachability from EL3:**
 ```
 EL2_implemented
 ∧ (SCR_EL3.NS = 1 ∨ SCR_EL3.EEL2 = 1)
-∧ SPSR_EL3.M[3:2] = 0b10
-→ target = EL2   ✅
+→ EL2 is a valid ERET target   ✅
 ```
+
+Typical usage: write `SCR_EL3.NS` to select the security world, configure
+`SPSR_EL3.M[3:2]` to encode the target EL, then execute `ERET`.
 
 ---
 
-## Summary Table
+## Complete Summary Table
 
 | Instruction | From EL | Target EL | Key Constraints |
 |-------------|---------|-----------|-----------------|
-| `SVC` | EL0 | EL1 | EL2 not implemented OR `HCR_EL2.TGE=0` |
-| `SVC` | EL0 | EL2 | EL2 implemented AND `HCR_EL2.TGE=1` |
-| `HVC` | EL1 | EL2 | EL2 implemented AND (`¬EL3` OR `SCR_EL3.HCE=1`) AND `HCR_EL2.HCD=0` |
-| `SMC` | EL1 | EL3 | EL3 implemented AND `SCR_EL3.SMD=0` |
-| `SMC` | EL2 | EL3 | EL3 implemented AND `SCR_EL3.SMD=0` |
-| `ERET` | EL1 | EL0 | `SPSR_EL1.M[3:2]=0b00` |
-| `ERET` | EL2 | EL0 | `SPSR_EL2.M[3:2]=0b00` |
-| `ERET` | EL2 | EL1 | `SPSR_EL2.M[3:2]=0b01` |
-| `ERET` | EL3 | EL0 | `SPSR_EL3.M[3:2]=0b00` |
-| `ERET` | EL3 | EL1 | `SPSR_EL3.M[3:2]=0b01` |
-| `ERET` | EL3 | EL2 | `SPSR_EL3.M[3:2]=0b10` AND EL2 implemented AND (`SCR_EL3.NS=1` OR `SCR_EL3.EEL2=1`) |
+| `SVC` | EL0 | EL1 | EL2 absent **or** `HCR_EL2.TGE=0` |
+| `SVC` | EL0 | EL2 | EL2 implemented **and** `HCR_EL2.TGE=1` |
+| `HVC` | EL1 | EL2 | EL2 present **∧** not VHE host mode **∧** (`¬EL3` ∨ `HCE=1`) **∧** `HCD=0` |
+| `SMC` | EL1 | EL2 *(trap)* | EL2 present **∧** `TSC=1` **∧** Non-Secure **∧** not VHE host |
+| `SMC` | EL1 | EL3 | TSC inactive **∧** EL3 present **∧** `SMD=0` |
+| `SMC` | EL2 | EL3 | EL3 present **∧** `SMD=0` *(TSC does not apply to EL2)* |
+| `ERET` | EL1 | EL0 | Always valid (EL0 always present) |
+| `ERET` | EL2 | EL0, EL1 | Always valid |
+| `ERET` | EL3 | EL0, EL1 | Always valid |
+| `ERET` | EL3 | EL2 | EL2 present **∧** (`NS=1` ∨ `EEL2=1`) |
 
 ---
 
-## Security State and `SCR_EL3.NS`
+## Registers That Do Not Affect EL Switching
 
-When executing at EL3, `SCR_EL3.NS` controls the security state of lower ELs:
+| Register / Field | Reason not relevant |
+|-----------------|---------------------|
+| `HCR_EL2.DC` (bit 12) | Controls stage-2 translation cacheability only; no effect on exception routing. |
+| `HCR_EL2.VM` (bit 0) | Enables stage-2 translation; no effect on which EL an exception is taken to. |
+| `SCR_EL3.IRQ/FIQ/EA` | Route physical interrupts/SErrors; irrelevant to manual SVC/HVC/SMC/ERET. |
+| `SCR_EL3.RW` (bit 10) | Controls AArch32/AArch64 state of lower ELs; does not gate EL switching itself. |
 
-- `SCR_EL3.NS = 0` → Secure World (lower ELs are in Secure state)
-- `SCR_EL3.NS = 1` → Normal World (lower ELs are in Non-Secure state)
-
-Writing `SCR_EL3.NS` at EL3 is the standard way to switch between Secure and
-Non-Secure worlds before issuing an `ERET` to the target EL. This bit is
-automatically updated on exception entry to EL3.
-
-Additionally, `SCR_EL3.EEL2 = 1` enables Secure EL2 (ARMv8.4-SecEL2 extension).
-Without it, EL2 only exists in Non-Secure state.

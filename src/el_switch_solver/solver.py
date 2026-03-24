@@ -7,11 +7,14 @@ Usage (after installing with ``uv``):
    # Check whether HVC from EL1 can reach EL2
    el-switch --el 1 --instr hvc
 
-   # Check ERET from EL3 given a specific SPSR (M=0b1000 → target EL2)
-   el-switch --el 3 --instr eret --spsr-m 8
+   # HVC from EL1 in VHE host mode (E2H=1, TGE=1) → UNDEF
+   el-switch --el 1 --instr hvc --hcr-e2h 1 --hcr-tge 1
 
-   # Non-Secure ERET from EL3 to EL2 (SCR_EL3.NS=1)
-   el-switch --el 3 --instr eret --spsr-m 8 --scr-ns 1
+   # SMC from EL1: TSC=1 traps to EL2 instead of EL3
+   el-switch --el 1 --instr smc --hcr-tsc 1
+
+   # ERET from EL3 — enumerate all reachable ELs (Non-Secure world)
+   el-switch --el 3 --instr eret --scr-ns 1
 
    # Enumerate all valid switches from EL1
    el-switch --el 1 --all
@@ -21,16 +24,16 @@ Alternatively import and use the Python API directly:
 .. code-block:: python
 
    from el_switch_solver.models import (
-       ExceptionLevel, HCR_EL2, SCR_EL3, SPSR, SystemState,
+       ExceptionLevel, HCR_EL2, SCR_EL3, SystemState,
    )
-   from el_switch_solver.solver import solve
+   from el_switch_solver.solver import solve, solve_all
 
    state = SystemState(
        current_el=ExceptionLevel.EL1,
        el2_implemented=True,
        el3_implemented=True,
        scr_el3=SCR_EL3(hce=1),
-       hcr_el2=HCR_EL2(hcd=0),
+       hcr_el2=HCR_EL2(hcd=0, tsc=0),
    )
    result = solve("hvc", state)
    print(result)
@@ -48,7 +51,6 @@ from .models import (
     HCR_EL2,
     Instruction,
     SCR_EL3,
-    SPSR,
     SwitchResult,
     SystemState,
 )
@@ -74,7 +76,9 @@ def solve(instruction: str, state: SystemState) -> SwitchResult:
     Returns
     -------
     SwitchResult
-        Describes the outcome, target EL, and any constraint violations.
+        ``valid_targets`` lists all architecturally reachable destination ELs.
+        For SVC/HVC/SMC this is at most one EL (routing is deterministic).
+        For ERET it may be multiple ELs (SPSR_ELn selects the actual target).
 
     Raises
     ------
@@ -109,9 +113,11 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="el-switch",
         description=(
             "AArch64 Exception Level switching constraint solver.\n\n"
-            "Evaluates whether a given instruction (SVC/HVC/SMC/ERET) "
-            "can legally switch from the current exception level, "
-            "given the current system register values."
+            "Evaluates which ELs are architecturally reachable from the "
+            "current exception level via SVC/HVC/SMC/ERET, "
+            "given the current system register values.\n\n"
+            "SPSR_ELn is intentionally excluded: it is software-controlled "
+            "and does not constrain reachability."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -150,39 +156,32 @@ def _build_parser() -> argparse.ArgumentParser:
     # SCR_EL3 bits
     scr = parser.add_argument_group("SCR_EL3 bits (only relevant when EL3 is present)")
     scr.add_argument("--scr-ns",   type=int, choices=[0, 1], default=0,
-                     metavar="0|1", help="SCR_EL3.NS  (default: 0, Secure)")
+                     metavar="0|1", help="SCR_EL3.NS   (default: 0, Secure)")
     scr.add_argument("--scr-smd",  type=int, choices=[0, 1], default=0,
-                     metavar="0|1", help="SCR_EL3.SMD (default: 0, SMC enabled)")
+                     metavar="0|1", help="SCR_EL3.SMD  (default: 0, SMC enabled)")
     scr.add_argument("--scr-hce",  type=int, choices=[0, 1], default=1,
-                     metavar="0|1", help="SCR_EL3.HCE (default: 1, HVC enabled)")
+                     metavar="0|1", help="SCR_EL3.HCE  (default: 1, HVC enabled) "
+                                         "[Note: no 'SCR_EL3.HCR' field exists; "
+                                         "the correct field name is HCE]")
     scr.add_argument("--scr-rw",   type=int, choices=[0, 1], default=1,
-                     metavar="0|1", help="SCR_EL3.RW  (default: 1, AArch64)")
+                     metavar="0|1", help="SCR_EL3.RW   (default: 1, AArch64)")
     scr.add_argument("--scr-eel2", type=int, choices=[0, 1], default=0,
                      metavar="0|1", help="SCR_EL3.EEL2 (default: 0, Secure EL2 off)")
 
     # HCR_EL2 bits
     hcr = parser.add_argument_group("HCR_EL2 bits (only relevant when EL2 is present)")
+    hcr.add_argument("--hcr-tsc", type=int, choices=[0, 1], default=0,
+                     metavar="0|1", help="HCR_EL2.TSC (default: 0); "
+                                         "when 1, Non-secure EL1 SMC is trapped to EL2")
     hcr.add_argument("--hcr-tge", type=int, choices=[0, 1], default=0,
-                     metavar="0|1", help="HCR_EL2.TGE (default: 0)")
+                     metavar="0|1", help="HCR_EL2.TGE (default: 0); "
+                                         "when 1, EL0 exceptions route to EL2")
     hcr.add_argument("--hcr-hcd", type=int, choices=[0, 1], default=0,
-                     metavar="0|1", help="HCR_EL2.HCD (default: 0)")
+                     metavar="0|1", help="HCR_EL2.HCD (default: 0); "
+                                         "when 1, HVC from EL1 is disabled")
     hcr.add_argument("--hcr-e2h", type=int, choices=[0, 1], default=0,
-                     metavar="0|1", help="HCR_EL2.E2H (default: 0)")
-
-    # SPSR (for ERET)
-    spsr = parser.add_argument_group("SPSR bits (only used for ERET)")
-    spsr.add_argument(
-        "--spsr-m",
-        type=lambda x: int(x, 0),
-        default=0,
-        metavar="M",
-        help=(
-            "SPSR.M[3:0] value (0–15). Determines target EL for ERET. "
-            "Accepts decimal or 0b/0x prefixed. "
-            "E.g. 0 (EL0), 4 (EL1t), 5 (EL1h), 8 (EL2t), 9 (EL2h). "
-            "(default: 0)"
-        ),
-    )
+                     metavar="0|1", help="HCR_EL2.E2H (default: 0); "
+                                         "VHE host mode when combined with TGE=1")
 
     return parser
 
@@ -204,11 +203,11 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover
             eel2=args.scr_eel2,
         ),
         hcr_el2=HCR_EL2(
+            tsc=args.hcr_tsc,
             tge=args.hcr_tge,
             hcd=args.hcr_hcd,
             e2h=args.hcr_e2h,
         ),
-        spsr=SPSR(m=args.spsr_m),
     )
 
     if args.instr == "all":
@@ -227,3 +226,4 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover
 
 if __name__ == "__main__":
     main()
+

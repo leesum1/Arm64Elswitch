@@ -1,12 +1,16 @@
 """Constraint evaluation for each AArch64 EL-switching instruction.
 
 Each public function accepts a :class:`~el_switch_solver.models.SystemState`
-and returns a :class:`~el_switch_solver.models.SwitchResult` that describes
-whether the requested EL switch is architecturally legal and, if not, which
-constraints were violated.
+and returns a :class:`~el_switch_solver.models.SwitchResult` that lists all
+architecturally legal target ELs and describes any constraint violations.
+
+SPSR_ELn is intentionally excluded from all checks: it is software-controlled
+and therefore not an architectural constraint.  The solver enumerates every EL
+that is reachable given the *hardware* register state; the caller must then
+configure SPSR_ELn to match the desired target.
 
 Reference: Arm Architecture Reference Manual for A-profile architecture
-           (DDI 0487), Chapter D1 (System-level architecture).
+           (DDI 0487), Sections D1.10–D1.14.
 """
 
 from __future__ import annotations
@@ -21,6 +25,34 @@ from .models import (
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_non_secure(state: SystemState) -> bool:
+    """Return True when lower ELs are in Non-Secure state.
+
+    The processor is Non-Secure when EL3 is not implemented (there is only
+    one security world) or when SCR_EL3.NS = 1.
+    """
+    return not state.el3_implemented or state.scr_el3.ns == 1
+
+
+def _is_vhe_host_mode(state: SystemState) -> bool:
+    """Return True when the VHE host mode is active (E2H=1 AND TGE=1).
+
+    In this mode the hypervisor host OS runs directly at EL2 and exceptions
+    from lower ELs are routed differently.  Several HCR_EL2 bits (e.g. TSC)
+    are inactive in this mode.
+    """
+    return (
+        state.el2_implemented
+        and state.hcr_el2.e2h == 1
+        and state.hcr_el2.tge == 1
+    )
+
+
+# ---------------------------------------------------------------------------
 # SVC
 # ---------------------------------------------------------------------------
 
@@ -28,12 +60,13 @@ from .models import (
 def check_svc(state: SystemState) -> SwitchResult:
     """Evaluate ``SVC`` executed at ``state.current_el``.
 
-    SVC causes a synchronous exception routed to EL1 or EL2:
+    Routing rules (DDI 0487 D1.10.1):
 
-    * At **EL0**: routed to EL2 when EL2 is implemented and
-      ``HCR_EL2.TGE = 1``; otherwise routed to EL1.
-    * At **EL1** and above: the exception stays at the same level; this is
-      *not* an inter-level switch and is therefore reported as invalid here.
+    * **EL0 → EL2**: EL2 is implemented AND ``HCR_EL2.TGE = 1``.
+      Regardless of security state: TGE routes *all* EL0 exceptions to EL2.
+    * **EL0 → EL1**: otherwise (EL2 absent or ``HCR_EL2.TGE = 0``).
+    * **EL1 and above**: SVC is taken at the *current* EL (not an inter-level
+      switch) and is therefore out of scope.
     """
     el = state.current_el
 
@@ -41,23 +74,21 @@ def check_svc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=Instruction.SVC,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason=(
-                f"SVC at {el} does not change the exception level "
-                "(exception is taken at the current EL)."
+                f"SVC at {el} causes a same-level exception and does not "
+                "change the exception level."
             ),
         )
 
-    # EL0 path
+    # EL0 path: TGE wins over everything else when EL2 is present.
     if state.el2_implemented and state.hcr_el2.tge == 1:
         return SwitchResult(
             instruction=Instruction.SVC,
             current_el=el,
-            target_el=ExceptionLevel.EL2,
-            is_valid=True,
+            valid_targets=[ExceptionLevel.EL2],
             reason=(
-                "EL2 is implemented and HCR_EL2.TGE=1 → "
+                "EL2 implemented and HCR_EL2.TGE=1 → "
                 "SVC from EL0 is routed to EL2."
             ),
         )
@@ -65,10 +96,9 @@ def check_svc(state: SystemState) -> SwitchResult:
     return SwitchResult(
         instruction=Instruction.SVC,
         current_el=el,
-        target_el=ExceptionLevel.EL1,
-        is_valid=True,
+        valid_targets=[ExceptionLevel.EL1],
         reason=(
-            "EL2 not implemented or HCR_EL2.TGE=0 → "
+            "HCR_EL2.TGE=0 (or EL2 absent) → "
             "SVC from EL0 is routed to EL1."
         ),
     )
@@ -82,15 +112,24 @@ def check_svc(state: SystemState) -> SwitchResult:
 def check_hvc(state: SystemState) -> SwitchResult:
     """Evaluate ``HVC`` executed at ``state.current_el``.
 
-    HVC from EL1 causes a synchronous exception to EL2 when all three
-    conditions below hold:
+    Routing rules (DDI 0487 D1.14.9):
+
+    **EL0**: always UNDEFINED.
+
+    **EL1 → EL2**: all four conditions below must hold:
 
     1. EL2 is implemented.
-    2. EL3 is not implemented **or** ``SCR_EL3.HCE = 1``.
-    3. ``HCR_EL2.HCD = 0``.
+    2. ``HCR_EL2.E2H = 0`` OR ``HCR_EL2.TGE = 0`` — in VHE host mode
+       (E2H=1, TGE=1) HVC from EL1 is UNDEFINED.
+    3. EL3 not implemented, **OR** ``SCR_EL3.HCE = 1`` — when EL3 is
+       present, HCE must enable the instruction.
+    4. ``HCR_EL2.HCD = 0`` — the HVC-disable bit must be clear.
 
-    HVC from EL0 is always UNDEFINED.
-    HVC from EL2/EL3 does not change the exception level.
+    **EL2 / EL3**: HVC causes a same-level exception or is a NOP;
+    no inter-level switch occurs.
+
+    Note: there is **no** field named ``SCR_EL3.HCR``; the relevant
+    SCR_EL3 bit for HVC enablement is ``HCE`` (bit 8).
     """
     el = state.current_el
     instr = Instruction.HVC
@@ -99,8 +138,7 @@ def check_hvc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason="HVC at EL0 is architecturally UNDEFINED.",
             violations=[
                 ConstraintViolation(
@@ -114,11 +152,10 @@ def check_hvc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason=(
-                f"HVC at {el} does not perform an inter-level switch "
-                "(exception is taken at the current EL or is a NOP)."
+                f"HVC at {el} causes a same-level exception or is a NOP; "
+                "no inter-level switch occurs."
             ),
         )
 
@@ -130,6 +167,14 @@ def check_hvc(state: SystemState) -> SwitchResult:
             ConstraintViolation(
                 "EL2 not implemented",
                 "HVC requires EL2 to be implemented.",
+            )
+        )
+
+    if state.el2_implemented and _is_vhe_host_mode(state):
+        violations.append(
+            ConstraintViolation(
+                "VHE host mode (HCR_EL2.E2H=1, HCR_EL2.TGE=1)",
+                "In VHE host mode HVC from EL1 is architecturally UNDEFINED.",
             )
         )
 
@@ -145,8 +190,7 @@ def check_hvc(state: SystemState) -> SwitchResult:
         violations.append(
             ConstraintViolation(
                 "HCR_EL2.HCD=1",
-                "HCR_EL2.HCD=1 traps HVC to EL3 or causes UNDEF; "
-                "EL2 is not reached.",
+                "HCR_EL2.HCD=1 disables HVC from EL1 (trapped to EL3 or UNDEF).",
             )
         )
 
@@ -154,8 +198,7 @@ def check_hvc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason="HVC from EL1 to EL2 is blocked by one or more constraints.",
             violations=violations,
         )
@@ -163,11 +206,11 @@ def check_hvc(state: SystemState) -> SwitchResult:
     return SwitchResult(
         instruction=instr,
         current_el=el,
-        target_el=ExceptionLevel.EL2,
-        is_valid=True,
+        valid_targets=[ExceptionLevel.EL2],
         reason=(
-            "EL2 implemented, SCR_EL3.HCE=1 (or EL3 absent), "
-            "and HCR_EL2.HCD=0 → HVC from EL1 reaches EL2."
+            "EL2 implemented, not in VHE host mode, "
+            "SCR_EL3.HCE=1 (or EL3 absent), HCR_EL2.HCD=0 → "
+            "HVC from EL1 reaches EL2."
         ),
     )
 
@@ -180,13 +223,27 @@ def check_hvc(state: SystemState) -> SwitchResult:
 def check_smc(state: SystemState) -> SwitchResult:
     """Evaluate ``SMC`` executed at ``state.current_el``.
 
-    SMC from EL1 or EL2 causes a synchronous exception to EL3 when:
+    Routing rules (DDI 0487 D1.14.10):
 
-    1. EL3 is implemented.
-    2. ``SCR_EL3.SMD = 0``.
+    **EL0**: always UNDEFINED.
 
-    SMC from EL0 is always UNDEFINED.
-    SMC from EL3 is treated as a NOP (no EL change).
+    **EL1 → EL2 (trap via TSC)**:
+      ``HCR_EL2.TSC = 1`` AND EL2 is implemented AND in Non-Secure state
+      (SCR_EL3.NS=1 or EL3 absent) AND NOT in VHE host mode (E2H=0 or TGE=0).
+      This trap takes priority over the EL3 path below.
+
+    **EL1 → EL3**:
+      ``HCR_EL2.TSC = 0`` (or TSC inactive) AND EL3 is implemented
+      AND ``SCR_EL3.SMD = 0``.
+
+    **EL2 → EL3**:
+      EL3 is implemented AND ``SCR_EL3.SMD = 0``.
+      (TSC applies only to EL1 execution, not EL2.)
+
+    **EL3**: SMC is a NOP (no exception level change).
+
+    Note: ``HCR_EL2.DC`` (Default Cacheability, bit 12) controls stage-2
+    translation cacheability and has **no effect** on exception routing.
     """
     el = state.current_el
     instr = Instruction.SMC
@@ -195,8 +252,7 @@ def check_smc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason="SMC at EL0 is architecturally UNDEFINED.",
             violations=[
                 ConstraintViolation(
@@ -210,13 +266,73 @@ def check_smc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason="SMC at EL3 is a NOP (no exception level change).",
         )
 
-    # EL1 or EL2 path
-    violations: list[ConstraintViolation] = []
+    if el == ExceptionLevel.EL1:
+        non_secure = _is_non_secure(state)
+        vhe_host = _is_vhe_host_mode(state)
+
+        # TSC trap path (EL1 only, Non-Secure, not VHE host mode).
+        tsc_active = (
+            state.el2_implemented
+            and state.hcr_el2.tsc == 1
+            and non_secure
+            and not vhe_host
+        )
+        if tsc_active:
+            return SwitchResult(
+                instruction=instr,
+                current_el=el,
+                valid_targets=[ExceptionLevel.EL2],
+                reason=(
+                    "HCR_EL2.TSC=1 in Non-Secure state (and not VHE host mode) → "
+                    "SMC from EL1 is trapped to EL2."
+                ),
+            )
+
+        # Normal EL3 path.
+        violations: list[ConstraintViolation] = []
+
+        if not state.el3_implemented:
+            violations.append(
+                ConstraintViolation(
+                    "EL3 not implemented",
+                    "SMC requires EL3 to be implemented "
+                    "(and HCR_EL2.TSC=0 or inactive).",
+                )
+            )
+
+        if state.el3_implemented and state.scr_el3.smd == 1:
+            violations.append(
+                ConstraintViolation(
+                    "SCR_EL3.SMD=1",
+                    "SCR_EL3.SMD=1 disables SMC from EL1 (UNDEF).",
+                )
+            )
+
+        if violations:
+            return SwitchResult(
+                instruction=instr,
+                current_el=el,
+                valid_targets=[],
+                reason="SMC from EL1 to EL3 is blocked by one or more constraints.",
+                violations=violations,
+            )
+
+        return SwitchResult(
+            instruction=instr,
+            current_el=el,
+            valid_targets=[ExceptionLevel.EL3],
+            reason=(
+                "EL3 implemented, SCR_EL3.SMD=0, HCR_EL2.TSC=0 (or inactive) → "
+                "SMC from EL1 reaches EL3."
+            ),
+        )
+
+    # EL2 → EL3 path (TSC does not apply to EL2 execution).
+    violations = []
 
     if not state.el3_implemented:
         violations.append(
@@ -230,7 +346,7 @@ def check_smc(state: SystemState) -> SwitchResult:
         violations.append(
             ConstraintViolation(
                 "SCR_EL3.SMD=1",
-                "SCR_EL3.SMD=1 disables SMC (UNDEF or trapped).",
+                "SCR_EL3.SMD=1 disables SMC from EL2 (UNDEF).",
             )
         )
 
@@ -238,20 +354,18 @@ def check_smc(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
-            reason=f"SMC from {el} to EL3 is blocked by one or more constraints.",
+            valid_targets=[],
+            reason="SMC from EL2 to EL3 is blocked by one or more constraints.",
             violations=violations,
         )
 
     return SwitchResult(
         instruction=instr,
         current_el=el,
-        target_el=ExceptionLevel.EL3,
-        is_valid=True,
+        valid_targets=[ExceptionLevel.EL3],
         reason=(
-            f"EL3 implemented and SCR_EL3.SMD=0 → "
-            f"SMC from {el} reaches EL3."
+            "EL3 implemented and SCR_EL3.SMD=0 → "
+            "SMC from EL2 reaches EL3."
         ),
     )
 
@@ -264,14 +378,19 @@ def check_smc(state: SystemState) -> SwitchResult:
 def check_eret(state: SystemState) -> SwitchResult:
     """Evaluate ``ERET`` executed at ``state.current_el``.
 
-    ERET returns to the exception level encoded in ``SPSR_ELn.M[3:2]``.
-    The target EL must be *strictly lower* than the current EL (same-level
-    return is architecturally reserved/illegal).
+    ERET restores execution to the EL encoded in ``SPSR_ELn.M[3:2]``.
+    Because SPSR is software-controlled (the caller sets it), this function
+    reports **all** ELs that are architecturally reachable, letting the caller
+    choose the actual target by configuring SPSR_ELn appropriately.
 
-    Additional constraint for ERET from EL3 to EL2:
-      EL2 must be implemented and accessible in the current security state:
-      ``SCR_EL3.NS = 1`` (Non-Secure EL2) **or** ``SCR_EL3.EEL2 = 1``
-      (Secure EL2 extension enabled).
+    Reachability rules (DDI 0487 D1.11.1):
+
+    * **EL0**: UNDEFINED.
+    * **EL1**: can return to EL0 (always valid).
+    * **EL2**: can return to EL0 or EL1 (both always valid).
+    * **EL3**: can return to EL0 or EL1 (always valid).  EL2 is also
+      reachable when EL2 is implemented AND (``SCR_EL3.NS = 1`` **or**
+      ``SCR_EL3.EEL2 = 1``).
     """
     el = state.current_el
     instr = Instruction.ERET
@@ -280,8 +399,7 @@ def check_eret(state: SystemState) -> SwitchResult:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[],
             reason="ERET at EL0 is architecturally UNDEFINED.",
             violations=[
                 ConstraintViolation(
@@ -291,79 +409,66 @@ def check_eret(state: SystemState) -> SwitchResult:
             ],
         )
 
-    target_el = state.spsr.target_el
-    violations: list[ConstraintViolation] = []
-
-    # Target must be strictly lower than current EL.
-    if target_el >= el:
-        violations.append(
-            ConstraintViolation(
-                "Illegal exception return level",
-                f"SPSR_EL{el.value}.M[3:2]={target_el.value} encodes {target_el}, "
-                f"which is >= current {el}. ERET cannot return to the same "
-                "or a higher exception level.",
-            )
-        )
+    if el == ExceptionLevel.EL1:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[ExceptionLevel.EL0],
             reason=(
-                f"SPSR_EL{el.value} encodes {target_el} which is not "
-                f"below current {el}."
+                "ERET from EL1 can return to EL0. "
+                "Set SPSR_EL1.M[3:0]=0b0000 (EL0t) or 0b0000 (EL0) before ERET."
             ),
-            violations=violations,
         )
 
-    # Additional check: ERET from EL3 to EL2
-    if el == ExceptionLevel.EL3 and target_el == ExceptionLevel.EL2:
-        if not state.el2_implemented:
-            violations.append(
-                ConstraintViolation(
-                    "EL2 not implemented",
-                    "Cannot ERET to EL2 when EL2 is not implemented.",
-                )
-            )
-        else:
-            # EL2 must be accessible for the current security state.
-            ns = state.scr_el3.ns
-            eel2 = state.scr_el3.eel2
-            if ns == 0 and eel2 == 0:
-                violations.append(
-                    ConstraintViolation(
-                        "Secure EL2 not enabled",
-                        "SCR_EL3.NS=0 (Secure state) and SCR_EL3.EEL2=0. "
-                        "EL2 is not available in Secure state. "
-                        "Set SCR_EL3.NS=1 (Non-Secure) or "
-                        "SCR_EL3.EEL2=1 (Secure EL2 extension).",
-                    )
-                )
-
-    # ERET from EL2 to EL0: EL0 is always present, no extra checks needed.
-    # ERET from EL2 to EL1: EL1 is always present, no extra checks needed.
-    # ERET from EL1 to EL0: EL0 is always present, no extra checks needed.
-
-    if violations:
+    if el == ExceptionLevel.EL2:
         return SwitchResult(
             instruction=instr,
             current_el=el,
-            target_el=None,
-            is_valid=False,
+            valid_targets=[ExceptionLevel.EL0, ExceptionLevel.EL1],
             reason=(
-                f"ERET from {el} to {target_el} is blocked "
-                "by one or more constraints."
+                "ERET from EL2 can return to EL0 or EL1. "
+                "Set SPSR_EL2.M[3:2]=0b00 (EL0) or 0b01 (EL1) before ERET."
             ),
-            violations=violations,
         )
+
+    # EL3 path
+    valid_targets: list[ExceptionLevel] = [ExceptionLevel.EL0, ExceptionLevel.EL1]
+    el2_notes: list[str] = []
+
+    if not state.el2_implemented:
+        el2_notes.append("EL2 is not implemented")
+    elif state.scr_el3.ns == 0 and state.scr_el3.eel2 == 0:
+        el2_notes.append(
+            "SCR_EL3.NS=0 (Secure state) and SCR_EL3.EEL2=0: "
+            "Secure EL2 is not enabled. "
+            "Set SCR_EL3.NS=1 (Non-Secure) or SCR_EL3.EEL2=1 (ARMv8.4-SecEL2) "
+            "to make EL2 reachable."
+        )
+    else:
+        valid_targets.append(ExceptionLevel.EL2)
+
+    parts = [
+        f"ERET from EL3 can return to: "
+        f"{', '.join(str(t) for t in valid_targets)}."
+    ]
+    if el2_notes:
+        parts.append(f"EL2 not reachable: {el2_notes[0]}.")
+    else:
+        parts.append(
+            "EL2 reachable: EL2 implemented and accessible in current security state."
+        )
+
+    violations = (
+        [ConstraintViolation("EL2 not reachable from EL3", el2_notes[0])]
+        if el2_notes
+        else []
+    )
 
     return SwitchResult(
         instruction=instr,
         current_el=el,
-        target_el=target_el,
-        is_valid=True,
-        reason=(
-            f"SPSR_EL{el.value}.M[3:2]={target_el.value} is valid → "
-            f"ERET from {el} returns to {target_el}."
-        ),
+        valid_targets=valid_targets,
+        reason=" ".join(parts),
+        violations=violations,
     )
+
